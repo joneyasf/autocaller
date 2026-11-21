@@ -138,14 +138,14 @@ class CallService : Service() {
             applicationContext,
             onPreciseStateChanged = { precise ->
                 when (precise) {
-                    TelephonyManager.PRECISE_CALL_STATE_ACTIVE -> {
+                    CallStateMonitor.PRECISE_ACTIVE -> {
                         everActive = true
                         if (!outcome.isCompleted) outcome.complete(Outcome.Answered)
                     }
-                    TelephonyManager.PRECISE_CALL_STATE_DIALING -> {
+                    CallStateMonitor.PRECISE_DIALING -> {
                         if (dialStartedAt < 0) dialStartedAt = System.currentTimeMillis()
                     }
-                    TelephonyManager.PRECISE_CALL_STATE_DISCONNECTED -> {
+                    CallStateMonitor.PRECISE_DISCONNECTED -> {
                         if (!outcome.isCompleted) {
                             endedAt = System.currentTimeMillis()
                             outcome.complete(Outcome.Ended)

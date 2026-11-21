@@ -25,9 +25,11 @@ import java.util.concurrent.Executor
  *
  * Correct detection:
  * - API 31+: TelephonyCallback.PreciseCallStateListener.
- *   TelephonyManager.PRECISE_CALL_STATE_ACTIVE = the remote side
- *   answered. PRECISE_CALL_STATE_DIALING = ringing out, NOT answered.
- *   PRECISE_CALL_STATE_DISCONNECTED = call ended.
+ *   CallStateMonitor.PRECISE_ACTIVE (= 1) = the remote side
+ *   answered. PRECISE_DIALING (= 3) = ringing out, NOT answered.
+ *   PRECISE_DISCONNECTED (= 7) = call ended.
+ *   (Values copied from AOSP PreciseCallState, which is @SystemApi
+ *   and cannot be referenced from an app.)
  * - API 26-30 (and as a safety net on all APIs): legacy
  *   PhoneStateListener OFFHOOK/RINGING/IDLE. OFFHOOK is recorded only
  *   as "line active", never as answered. The outcome is resolved when
@@ -104,6 +106,22 @@ class CallStateMonitor(
 
     companion object {
         private const val TAG = "CallStateMonitor"
+
+        /**
+         * Precise call-state values, copied from AOSP
+         * `android.telephony.PreciseCallState` — that class is @SystemApi,
+         * so its constants are NOT in the public SDK and cannot be
+         * referenced (neither as PreciseCallState.* nor as
+         * TelephonyManager.PRECISE_CALL_STATE_* — the latter does not
+         * exist at all). The public TelephonyCallback.PreciseCallStateListener
+         * still delivers these ints, so we define the values here:
+         * IDLE = 0, ACTIVE = 1 (remote side answered), DIALING = 3
+         * (ringing out, NOT answered), DISCONNECTED = 7 (call ended).
+         */
+        const val PRECISE_IDLE = 0
+        const val PRECISE_ACTIVE = 1
+        const val PRECISE_DIALING = 3
+        const val PRECISE_DISCONNECTED = 7
 
         /** Duration in seconds of the most recent outgoing call to [number]
          * that started after [sinceMillis], or null if READ_CALL_LOG is not
