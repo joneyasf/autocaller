@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -76,6 +77,8 @@ fun MainScreen(vm: MainViewModel) {
     var dialogOpen by remember { mutableStateOf(false) }
     var editing by remember { mutableStateOf<ScheduledCall?>(null) }
     var pendingDelete by remember { mutableStateOf<ScheduledCall?>(null) }
+    // Opening dua: shown on every app open (fresh composition after launch).
+    var showDuaDialog by remember { mutableStateOf(true) }
 
     // Re-check permissions every time the app comes to the foreground.
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -117,6 +120,23 @@ fun MainScreen(vm: MainViewModel) {
         }
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
+            // Persistent banner with the opening dua, below the app title.
+            Card(
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp).fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                )
+            ) {
+                Text(
+                    stringResource(R.string.opening_dua),
+                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+
             PermissionsCard(
                 status = status,
                 onGrantRuntime = {
@@ -170,6 +190,25 @@ fun MainScreen(vm: MainViewModel) {
             initial = editing,
             onDismiss = { dialogOpen = false },
             onSave = { vm.save(it); dialogOpen = false }
+        )
+    }
+
+    if (showDuaDialog) {
+        AlertDialog(
+            onDismissRequest = { showDuaDialog = false },
+            text = {
+                Text(
+                    stringResource(R.string.opening_dua),
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showDuaDialog = false }) {
+                    Text(stringResource(R.string.dua_dismiss))
+                }
+            }
         )
     }
 

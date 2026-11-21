@@ -138,14 +138,14 @@ class CallService : Service() {
             applicationContext,
             onPreciseStateChanged = { precise ->
                 when (precise) {
-                    android.telecom.Call.PRECISE_CALL_STATE_ACTIVE -> {
+                    TelephonyManager.PRECISE_CALL_STATE_ACTIVE -> {
                         everActive = true
                         if (!outcome.isCompleted) outcome.complete(Outcome.Answered)
                     }
-                    android.telecom.Call.PRECISE_CALL_STATE_DIALING -> {
+                    TelephonyManager.PRECISE_CALL_STATE_DIALING -> {
                         if (dialStartedAt < 0) dialStartedAt = System.currentTimeMillis()
                     }
-                    android.telecom.Call.PRECISE_CALL_STATE_DISCONNECTED -> {
+                    TelephonyManager.PRECISE_CALL_STATE_DISCONNECTED -> {
                         if (!outcome.isCompleted) {
                             endedAt = System.currentTimeMillis()
                             outcome.complete(Outcome.Ended)

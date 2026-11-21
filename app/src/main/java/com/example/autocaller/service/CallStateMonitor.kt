@@ -25,7 +25,7 @@ import java.util.concurrent.Executor
  *
  * Correct detection:
  * - API 31+: TelephonyCallback.PreciseCallStateListener.
- *   android.telecom.Call.PRECISE_CALL_STATE_ACTIVE = the remote side
+ *   TelephonyManager.PRECISE_CALL_STATE_ACTIVE = the remote side
  *   answered. PRECISE_CALL_STATE_DIALING = ringing out, NOT answered.
  *   PRECISE_CALL_STATE_DISCONNECTED = call ended.
  * - API 26-30 (and as a safety net on all APIs): legacy
