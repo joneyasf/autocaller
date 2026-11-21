@@ -176,6 +176,8 @@ object AlarmScheduler {
      * has not started a trigger cycle yet (attemptCount == 0,
      * lastAttemptMillis == 0) is scheduled 1 minute from now as a
      * queue-delay one-off instead of being dropped.
+     * Note: ChronoUnit.between() returns Long, so range checks here
+     * must use Long ranges (0L..24L), not Int ranges.
      * - One-time calls whose time passed (nextTriggerMillis == null)
      *   within the last 24h are re-fired once.
      * - Repeating calls whose *today's* occurrence passed within the

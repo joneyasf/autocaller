@@ -35,11 +35,15 @@ import kotlinx.coroutines.withTimeoutOrNull
  * it survives the app being closed.
  *
  * Outcome rules (v3 — fixed):
- * - PRECISE_CALL_STATE_ACTIVE (API 31+) = the remote side ANSWERED.
- *   OFFHOOK alone NEVER means answered for an outgoing call: it only
+ * - OFFHOOK alone NEVER means answered for an outgoing call: it only
  *   means dialling started. v2 completed every attempt as Answered on
  *   OFFHOOK, so retries 2, 3, 4 never rang.
- * - Call ends (DISCONNECTED / IDLE) without ACTIVE: resolve via CallLog
+ * - Answered is decided only after the call ends (IDLE), from the call
+ *   log (READ_CALL_LOG): duration >= 3s = answered, 0 = no answer /
+ *   rejected. There is no public "precise state" API for a normal app
+ *   (it is @SystemApi and needs a signature permission), so the
+ *   precise-state listener is deliberately NOT used.
+ * - Call ends (IDLE) without an answered duration: resolve via CallLog
  *   (READ_CALL_LOG): last outgoing call to this number in the last
  *   3 minutes with duration >= 3s = answered, duration == 0 =
  *   no answer / rejected. Without CallLog, timing fallback:
@@ -130,47 +134,27 @@ class CallService : Service() {
 
         val ringSeconds = call.ringDurationSeconds.coerceIn(5, 120)
         val outcome = CompletableDeferred<Outcome>()
-        var everActive = false
         var dialStartedAt = -1L
         var endedAt = -1L
 
-        val monitor = CallStateMonitor(
-            applicationContext,
-            onPreciseStateChanged = { precise ->
-                when (precise) {
-                    CallStateMonitor.PRECISE_ACTIVE -> {
-                        everActive = true
-                        if (!outcome.isCompleted) outcome.complete(Outcome.Answered)
-                    }
-                    CallStateMonitor.PRECISE_DIALING -> {
-                        if (dialStartedAt < 0) dialStartedAt = System.currentTimeMillis()
-                    }
-                    CallStateMonitor.PRECISE_DISCONNECTED -> {
-                        if (!outcome.isCompleted) {
-                            endedAt = System.currentTimeMillis()
-                            outcome.complete(Outcome.Ended)
-                        }
-                    }
-                    // PRECISE_CALL_STATE_RINGING is incoming only; ignore.
+        // Only the three public states (IDLE / RINGING / OFFHOOK).
+        // OFFHOOK on an outgoing call = dialling / line active, never
+        // an answer. The outcome is resolved when the call ends (IDLE)
+        // via CallLog — see resolveOutcome().
+        val monitor = CallStateMonitor(applicationContext) { state ->
+            when (state) {
+                TelephonyManager.CALL_STATE_OFFHOOK -> {
+                    if (dialStartedAt < 0) dialStartedAt = System.currentTimeMillis()
                 }
-            },
-            onLegacyStateChanged = { state ->
-                when (state) {
-                    // OFFHOOK on an outgoing call = dialling / line active.
-                    // It is NOT an answer. Record dial start only.
-                    TelephonyManager.CALL_STATE_OFFHOOK -> {
-                        if (dialStartedAt < 0) dialStartedAt = System.currentTimeMillis()
+                TelephonyManager.CALL_STATE_IDLE -> {
+                    if (!outcome.isCompleted) {
+                        endedAt = System.currentTimeMillis()
+                        outcome.complete(Outcome.Ended)
                     }
-                    TelephonyManager.CALL_STATE_IDLE -> {
-                        if (!outcome.isCompleted) {
-                            endedAt = System.currentTimeMillis()
-                            outcome.complete(Outcome.Ended)
-                        }
-                    }
-                    // RINGING is incoming only; ignore.
                 }
+                // RINGING is incoming only; ignore.
             }
-        )
+        }
 
         notify(buildNotification(getString(R.string.notif_calling, call.name)))
         monitor.start()
@@ -182,12 +166,12 @@ class CallService : Service() {
             }
             if (dialStartedAt < 0) dialStartedAt = attemptStartedAt
             // Observe for the user-set ring duration (+10s grace for the
-            // dialer / telecom to report state changes). ACTIVE completes
+            // dialer to report state changes). Call end (IDLE) completes
             // early; a timeout with the line still ringing = no answer.
             val raw = withTimeoutOrNull(ringSeconds * 1000L + 10_000L) {
                 outcome.await()
             } ?: Outcome.Timeout
-            val resolved = resolveOutcome(raw, call, dialStartedAt, endedAt, everActive)
+            val resolved = resolveOutcome(raw, call, dialStartedAt, endedAt)
             handleOutcome(call.copy(attemptCount = attemptNumber), resolved, dao)
         } finally {
             monitor.stop()
@@ -198,18 +182,19 @@ class CallService : Service() {
      * Turns a raw end-of-call signal into Answered / Rejected / NoAnswer.
      * CallLog is the authority when available; timing is the fallback.
      * The 5s rejected threshold applies only here, never to OFFHOOK.
+     * Note: a call answered for less than 3 seconds is treated as not
+     * answered (CallLog duration < 3s) — a rare edge, the retry then
+     * rings once more.
      */
     private fun resolveOutcome(
         raw: Outcome,
         call: ScheduledCall,
         dialStartedAt: Long,
-        endedAt: Long,
-        everActive: Boolean
+        endedAt: Long
     ): Outcome {
-        if (raw == Outcome.Answered || everActive) return Outcome.Answered
         if (raw == Outcome.NotPlaced) return Outcome.NotPlaced
         if (raw == Outcome.Timeout) return Outcome.NoAnswer
-        // raw == Ended: the call finished without ACTIVE.
+        // raw == Ended: the call finished. CallLog decides answered or not.
         val dialStart = if (dialStartedAt > 0) dialStartedAt else call.lastAttemptMillis
         val duration = CallStateMonitor.lastOutgoingCallDuration(
             applicationContext, call.number, dialStart - 5_000L

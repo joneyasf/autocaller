@@ -17,33 +17,28 @@ import java.util.concurrent.Executor
  * Observes the phone call state so CallService can tell whether a placed
  * OUTGOING call was answered, rejected, or simply not answered.
  *
- * CRITICAL (v3 fix): for OUTGOING calls, TelephonyManager.CALL_STATE_OFFHOOK
+ * CRITICAL: for OUTGOING calls, TelephonyManager.CALL_STATE_OFFHOOK
  * means "dialling started / line is active", NOT "the other side answered".
  * RINGING only occurs for INCOMING calls. The v2 code completed every
  * attempt as Answered the instant OFFHOOK fired, so retries 2, 3, 4
  * never rang.
  *
- * Correct detection:
- * - API 31+: TelephonyCallback.PreciseCallStateListener.
- *   CallStateMonitor.PRECISE_ACTIVE (= 1) = the remote side
- *   answered. PRECISE_DIALING (= 3) = ringing out, NOT answered.
- *   PRECISE_DISCONNECTED (= 7) = call ended.
- *   (Values copied from AOSP PreciseCallState, which is @SystemApi
- *   and cannot be referenced from an app.)
- * - API 26-30 (and as a safety net on all APIs): legacy
- *   PhoneStateListener OFFHOOK/RINGING/IDLE. OFFHOOK is recorded only
- *   as "line active", never as answered. The outcome is resolved when
- *   the call ends (IDLE / DISCONNECTED) by querying CallLog: the last
- *   outgoing call to this number in the last 3 minutes with
- *   duration >= 3s = answered, duration == 0 = no answer / rejected.
- *   Without READ_CALL_LOG the timing fallback applies (ended < 5s
- *   after dialling = rejected, ended after >= ringDurationSeconds
- *   = no answer).
+ * Why there is NO precise-state listener here: the "precise" API
+ * (TelephonyCallback.PreciseCallStateListener,
+ * onPreciseCallStateChanged(PreciseCallState)) is @SystemApi / @hide —
+ * it is not in the public SDK, and it requires READ_PRECISE_PHONE_STATE,
+ * a signature permission normal apps cannot hold. Using it fails the
+ * build. So this monitor only reports the three public states
+ * (IDLE / RINGING / OFFHOOK) and CallService resolves the outcome when
+ * the call ends (IDLE) by querying CallLog: the last outgoing call to
+ * this number in the last 3 minutes with duration >= 3s = answered,
+ * duration == 0 = no answer / rejected. Without READ_CALL_LOG the
+ * timing fallback applies (ended < 5s after dialling = rejected,
+ * otherwise no answer).
  */
 class CallStateMonitor(
     private val context: Context,
-    private val onPreciseStateChanged: (Int) -> Unit,
-    private val onLegacyStateChanged: (Int) -> Unit = {}
+    private val onStateChanged: (Int) -> Unit
 ) {
     private val telephony: TelephonyManager? =
         context.getSystemService(TelephonyManager::class.java)
@@ -57,14 +52,9 @@ class CallStateMonitor(
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val cb = object : TelephonyCallback(),
-                    TelephonyCallback.PreciseCallStateListener,
                     TelephonyCallback.CallStateListener {
-                    override fun onPreciseCallStateChanged(preciseCallState: Int) {
-                        onPreciseStateChanged(preciseCallState)
-                    }
-
                     override fun onCallStateChanged(state: Int) {
-                        onLegacyStateChanged(state)
+                        onStateChanged(state)
                     }
                 }
                 callback31 = cb
@@ -74,7 +64,7 @@ class CallStateMonitor(
                 val listener = object : PhoneStateListener() {
                     @Deprecated("Deprecated in Java")
                     override fun onCallStateChanged(state: Int, phoneNumber: String?) {
-                        onLegacyStateChanged(state)
+                        onStateChanged(state)
                     }
                 }
                 listenerLegacy = listener
@@ -106,22 +96,6 @@ class CallStateMonitor(
 
     companion object {
         private const val TAG = "CallStateMonitor"
-
-        /**
-         * Precise call-state values, copied from AOSP
-         * `android.telephony.PreciseCallState` — that class is @SystemApi,
-         * so its constants are NOT in the public SDK and cannot be
-         * referenced (neither as PreciseCallState.* nor as
-         * TelephonyManager.PRECISE_CALL_STATE_* — the latter does not
-         * exist at all). The public TelephonyCallback.PreciseCallStateListener
-         * still delivers these ints, so we define the values here:
-         * IDLE = 0, ACTIVE = 1 (remote side answered), DIALING = 3
-         * (ringing out, NOT answered), DISCONNECTED = 7 (call ended).
-         */
-        const val PRECISE_IDLE = 0
-        const val PRECISE_ACTIVE = 1
-        const val PRECISE_DIALING = 3
-        const val PRECISE_DISCONNECTED = 7
 
         /** Duration in seconds of the most recent outgoing call to [number]
          * that started after [sinceMillis], or null if READ_CALL_LOG is not
