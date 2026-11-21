@@ -41,15 +41,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Toggling re-arms the call as a fresh cycle: reset the retry counter.
         val updated = call.copy(enabled = enabled, attemptCount = 0)
         dao.update(updated)
-        AlarmScheduler.schedule(getApplication(), updated)
+        val ctx = getApplication<Application>()
+        if (!enabled) AlarmScheduler.cancelAll(ctx, updated.id)
+        AlarmScheduler.schedule(ctx, updated)
     }
 
     fun delete(call: ScheduledCall) = viewModelScope.launch {
-        AlarmScheduler.cancel(getApplication(), call.id)
+        AlarmScheduler.cancelAll(getApplication(), call.id)
         dao.delete(call)
     }
 
     fun rescheduleAll() = viewModelScope.launch {
-        AlarmScheduler.rescheduleAll(getApplication())
+        val ctx = getApplication<Application>()
+        AlarmScheduler.rescheduleAll(ctx)
+        AlarmScheduler.rescheduleOverdue(ctx)
+        AlarmScheduler.reschedulePendingRetries(ctx)
     }
 }

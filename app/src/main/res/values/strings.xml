@@ -24,6 +24,7 @@
     <string name="perm_title">أذونات ناقصة — لن يعمل الاتصال التلقائي بدونها</string>
     <string name="perm_call">إذن الاتصال (CALL_PHONE)</string>
     <string name="perm_phone_state">إذن حالة الهاتف (لمعرفة الشريحة والرد / الرفض)</string>
+    <string name="perm_call_log">إذن سجل المكالمات (لمعرفة إذا رد الطرف الآخر)</string>
     <string name="perm_notif">إذن الإشعارات</string>
     <string name="sim">الشريحة</string>
     <string name="sim_default">الافتراضية</string>

@@ -6,13 +6,25 @@ import android.content.Intent
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.autocaller.data.AppDatabase
-import com.example.autocaller.data.RepeatType
 import com.example.autocaller.service.CallPlacer
 import com.example.autocaller.service.CallService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
+/**
+ * Thin trigger only (v3 fix).
+ *
+ * v2 had an async coroutine here that reset attemptCount to 0 and
+ * re-armed the repeating schedule. That raced CallService: the receiver
+ * could wipe the retry alarm / attempt counter after CallService had
+ * already incremented it, so retries 2, 3, 4 never rang.
+ *
+ * The receiver now ONLY starts CallService with the callId / isRetry /
+ * isQueueDelay extras. All counter resets and re-arming of the next
+ * repeating occurrence happen inside CallService, after the trigger
+ * cycle finishes. No database writes here except the fallback path.
+ */
 class CallAlarmReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
@@ -36,29 +48,22 @@ class CallAlarmReceiver : BroadcastReceiver() {
             serviceStarted = false
         }
 
-        val pending = goAsync()
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val dao = AppDatabase.get(appContext).callDao()
-                val call = dao.getById(callId) ?: return@launch
-                // Main trigger only: re-arm the next occurrence right away
-                // for repeating calls. Retries and queue-delays must not
-                // re-arm the repeating schedule.
-                if (!isRetry && !isQueueDelay && call.enabled && call.repeat != RepeatType.ONCE) {
-                    AlarmScheduler.schedule(appContext, call)
+        if (!serviceStarted) {
+            // Fallback only: place the call from here. No counter reset,
+            // no re-arming — CallService / BootReceiver / app launch will
+            // re-arm the schedule; touching the counter here would race
+            // the service on a later start.
+            val pending = goAsync()
+            CoroutineScope(Dispatchers.IO).launch {
+                try {
+                    val dao = AppDatabase.get(appContext).callDao()
+                    val call = dao.getById(callId)
+                    if (call != null && call.enabled) {
+                        CallPlacer.place(appContext, call)
+                    }
+                } finally {
+                    pending.finish()
                 }
-                // Main trigger only: a new trigger cycle starts, so the
-                // retry counter resets. Retries keep their counter.
-                if (!isRetry && !isQueueDelay) {
-                    dao.update(call.copy(attemptCount = 0))
-                }
-                // Fallback: service could not start, place the call from here.
-                if (!serviceStarted && call.enabled) {
-                    CallPlacer.place(appContext, call)
-                    if (call.repeat == RepeatType.ONCE) dao.update(call.copy(enabled = false, attemptCount = 0))
-                }
-            } finally {
-                pending.finish()
             }
         }
     }

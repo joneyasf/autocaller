@@ -21,9 +21,19 @@ object AlarmScheduler {
     const val EXTRA_QUEUE_DELAY = "is_queue_delay"
     private const val TAG = "AlarmScheduler"
 
-    /** Request-code offset for retry / queue-delay alarms so they never
-     * collide with (or cancel) the main alarm of the same call. */
+    /** Distinct Intent actions so main / retry / queue PendingIntents
+     * can never match each other. Android ignores extras when matching
+     * PendingIntents, so extras alone do NOT separate them — the action
+     * (and request code) must differ. v2 shared both and one alarm
+     * overwrote the other. */
+    const val ACTION_MAIN = "com.example.autocaller.ACTION_MAIN"
+    const val ACTION_RETRY = "com.example.autocaller.ACTION_RETRY"
+    const val ACTION_QUEUE = "com.example.autocaller.ACTION_QUEUE"
+
+    /** Distinct request codes: MAIN = callId, RETRY = +1,000,000,
+     * QUEUE = +2,000,000. */
     private const val RETRY_CODE_OFFSET = 1_000_000
+    private const val QUEUE_CODE_OFFSET = 2_000_000
 
     /** Next trigger time in epoch millis, or null if there is none (expired one-time call). */
     fun nextTriggerMillis(call: ScheduledCall, now: LocalDateTime = LocalDateTime.now()): Long? {
@@ -48,9 +58,11 @@ object AlarmScheduler {
         return next?.atZone(ZoneId.systemDefault())?.toInstant()?.toEpochMilli()
     }
 
-    /** Schedules (or cancels, if disabled/expired) the alarm of one call. */
+    /** Schedules (or cancels, if disabled/expired) the main alarm of one call.
+     * Cancels ONLY the main alarm — never the retry or queue-delay alarm
+     * (v2 cancelled the retry here, racing CallService). */
     fun schedule(context: Context, call: ScheduledCall): Boolean {
-        cancel(context, call.id)
+        cancelMain(context, call.id)
         if (!call.enabled) return false
         val triggerAt = nextTriggerMillis(call) ?: return false
 
@@ -119,18 +131,87 @@ object AlarmScheduler {
         }
     }
 
-    fun cancel(context: Context, callId: Long) {
+    /** Cancel only the main alarm of a call. */
+    fun cancelMain(context: Context, callId: Long) {
         val alarmManager = context.getSystemService(AlarmManager::class.java)
         val pi = operationIntent(context, callId, isRetry = false, isQueueDelay = false)
         alarmManager.cancel(pi)
         pi.cancel()
-        val retryPi = operationIntent(context, callId, isRetry = true, isQueueDelay = false)
-        alarmManager.cancel(retryPi)
-        retryPi.cancel()
     }
+
+    /** Cancel only the retry alarm of a call. */
+    fun cancelRetry(context: Context, callId: Long) {
+        val alarmManager = context.getSystemService(AlarmManager::class.java)
+        val pi = operationIntent(context, callId, isRetry = true, isQueueDelay = false)
+        alarmManager.cancel(pi)
+        pi.cancel()
+    }
+
+    /** Cancel only the queue-delay alarm of a call. */
+    fun cancelQueue(context: Context, callId: Long) {
+        val alarmManager = context.getSystemService(AlarmManager::class.java)
+        val pi = operationIntent(context, callId, isRetry = false, isQueueDelay = true)
+        alarmManager.cancel(pi)
+        pi.cancel()
+    }
+
+    /** Cancel all three alarms of a call. Use only when the user disables
+     * or deletes a call. */
+    fun cancelAll(context: Context, callId: Long) {
+        cancelMain(context, callId)
+        cancelRetry(context, callId)
+        cancelQueue(context, callId)
+    }
+
+    /** Backwards-compatible: cancelling a call cancels all its alarms. */
+    fun cancel(context: Context, callId: Long) = cancelAll(context, callId)
 
     suspend fun rescheduleAll(context: Context) {
         AppDatabase.get(context).callDao().getEnabled().forEach { schedule(context, it) }
+    }
+
+    /**
+     * Overdue calls: an enabled call whose trigger time already passed
+     * (previous call still running, phone off, alarm missed) and which
+     * has not started a trigger cycle yet (attemptCount == 0,
+     * lastAttemptMillis == 0) is scheduled 1 minute from now as a
+     * queue-delay one-off instead of being dropped.
+     * - One-time calls whose time passed (nextTriggerMillis == null)
+     *   within the last 24h are re-fired once.
+     * - Repeating calls whose *today's* occurrence passed within the
+     *   last 60 minutes are re-fired once; older misses wait for the
+     *   next scheduled occurrence.
+     * Idempotent: once the delayed attempt dials, attemptCount becomes
+     * 1, so a later rescheduleOverdue() call skips it.
+     */
+    suspend fun rescheduleOverdue(context: Context) {
+        val dao = AppDatabase.get(context).callDao()
+        val now = LocalDateTime.now()
+        val nowMillis = System.currentTimeMillis()
+        dao.getEnabled().forEach { call ->
+            if (call.attemptCount != 0 || call.lastAttemptMillis != 0L) return@forEach
+            val time = LocalTime.of(call.hour, call.minute)
+            val startDate = LocalDate.ofEpochDay(call.dateEpochDay)
+            val start = LocalDateTime.of(startDate, time)
+            val next = nextTriggerMillis(call, now)
+            if (next == null) {
+                // Expired one-time call, missed within the last 24h.
+                if (ChronoUnit.HOURS.between(start, now) in 0..24) {
+                    Log.i(TAG, "Overdue one-time call ${call.id}, firing in 1 min")
+                    scheduleQueueDelay(context, call.id)
+                }
+            } else {
+                val todayTrigger = LocalDateTime.of(now.toLocalDate(), time)
+                if (!todayTrigger.toLocalDate().isBefore(startDate) &&
+                    todayTrigger.isBefore(now) &&
+                    ChronoUnit.MINUTES.between(todayTrigger, now) <= 60 &&
+                    next - nowMillis > 60 * 60_000L
+                ) {
+                    Log.i(TAG, "Overdue repeating call ${call.id}, firing in 1 min")
+                    scheduleQueueDelay(context, call.id)
+                }
+            }
+        }
     }
 
     /**
@@ -156,15 +237,16 @@ object AlarmScheduler {
         isRetry: Boolean,
         isQueueDelay: Boolean
     ): PendingIntent {
+        val (action, requestCode) = when {
+            isRetry -> ACTION_RETRY to (callId + RETRY_CODE_OFFSET).toInt()
+            isQueueDelay -> ACTION_QUEUE to (callId + QUEUE_CODE_OFFSET).toInt()
+            else -> ACTION_MAIN to callId.toInt()
+        }
         val intent = Intent(context, CallAlarmReceiver::class.java)
+            .setAction(action)
             .putExtra(EXTRA_CALL_ID, callId)
             .putExtra(EXTRA_RETRY, isRetry)
             .putExtra(EXTRA_QUEUE_DELAY, isQueueDelay)
-        val requestCode = if (isRetry || isQueueDelay) {
-            (callId + RETRY_CODE_OFFSET).toInt()
-        } else {
-            callId.toInt()
-        }
         return PendingIntent.getBroadcast(
             context,
             requestCode,

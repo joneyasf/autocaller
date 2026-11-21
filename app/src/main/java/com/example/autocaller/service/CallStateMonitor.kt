@@ -1,29 +1,47 @@
 package com.example.autocaller.service
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
+import android.provider.CallLog
 import android.telephony.PhoneStateListener
 import android.telephony.TelephonyCallback
 import android.telephony.TelephonyManager
 import android.util.Log
+import androidx.core.content.ContextCompat
 import java.util.concurrent.Executor
 
 /**
  * Observes the phone call state so CallService can tell whether a placed
- * call was answered, rejected, or simply not answered.
+ * OUTGOING call was answered, rejected, or simply not answered.
  *
- * TelephonyCallback (API 31+) is used when available, PhoneStateListener
- * as a fallback for API 26-30. Both report the same three states:
- * IDLE / RINGING / OFFHOOK (TelephonyManager.CALL_STATE_*).
+ * CRITICAL (v3 fix): for OUTGOING calls, TelephonyManager.CALL_STATE_OFFHOOK
+ * means "dialling started / line is active", NOT "the other side answered".
+ * RINGING only occurs for INCOMING calls. The v2 code completed every
+ * attempt as Answered the instant OFFHOOK fired, so retries 2, 3, 4
+ * never rang.
  *
- * The caller records the time of the first RINGING and whether OFFHOOK
- * was ever reached; CallService turns that into answered / rejected /
- * no-answer. This class does not decide anything itself.
+ * Correct detection:
+ * - API 31+: TelephonyCallback.PreciseCallStateListener.
+ *   android.telecom.Call.PRECISE_CALL_STATE_ACTIVE = the remote side
+ *   answered. PRECISE_CALL_STATE_DIALING = ringing out, NOT answered.
+ *   PRECISE_CALL_STATE_DISCONNECTED = call ended.
+ * - API 26-30 (and as a safety net on all APIs): legacy
+ *   PhoneStateListener OFFHOOK/RINGING/IDLE. OFFHOOK is recorded only
+ *   as "line active", never as answered. The outcome is resolved when
+ *   the call ends (IDLE / DISCONNECTED) by querying CallLog: the last
+ *   outgoing call to this number in the last 3 minutes with
+ *   duration >= 3s = answered, duration == 0 = no answer / rejected.
+ *   Without READ_CALL_LOG the timing fallback applies (ended < 5s
+ *   after dialling = rejected, ended after >= ringDurationSeconds
+ *   = no answer).
  */
 class CallStateMonitor(
     private val context: Context,
-    private val onStateChanged: (Int) -> Unit
+    private val onPreciseStateChanged: (Int) -> Unit,
+    private val onLegacyStateChanged: (Int) -> Unit = {}
 ) {
     private val telephony: TelephonyManager? =
         context.getSystemService(TelephonyManager::class.java)
@@ -36,9 +54,15 @@ class CallStateMonitor(
         val tm = telephony ?: return
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val cb = object : TelephonyCallback(), TelephonyCallback.CallStateListener {
+                val cb = object : TelephonyCallback(),
+                    TelephonyCallback.PreciseCallStateListener,
+                    TelephonyCallback.CallStateListener {
+                    override fun onPreciseCallStateChanged(preciseCallState: Int) {
+                        onPreciseStateChanged(preciseCallState)
+                    }
+
                     override fun onCallStateChanged(state: Int) {
-                        onStateChanged(state)
+                        onLegacyStateChanged(state)
                     }
                 }
                 callback31 = cb
@@ -48,7 +72,7 @@ class CallStateMonitor(
                 val listener = object : PhoneStateListener() {
                     @Deprecated("Deprecated in Java")
                     override fun onCallStateChanged(state: Int, phoneNumber: String?) {
-                        onStateChanged(state)
+                        onLegacyStateChanged(state)
                     }
                 }
                 listenerLegacy = listener
@@ -80,5 +104,46 @@ class CallStateMonitor(
 
     companion object {
         private const val TAG = "CallStateMonitor"
+
+        /** Duration in seconds of the most recent outgoing call to [number]
+         * that started after [sinceMillis], or null if READ_CALL_LOG is not
+         * granted, the call log has no matching row yet, or the query fails.
+         * Number matching uses the last 9 digits so country-code formatting
+         * differences do not break the match. */
+        fun lastOutgoingCallDuration(
+            context: Context,
+            number: String,
+            sinceMillis: Long
+        ): Long? {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALL_LOG)
+                != PackageManager.PERMISSION_GRANTED
+            ) return null
+            val wanted = number.filter { it.isDigit() }.takeLast(9)
+            if (wanted.isEmpty()) return null
+            return try {
+                val cursor = context.contentResolver.query(
+                    CallLog.Calls.CONTENT_URI,
+                    arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.DURATION, CallLog.Calls.DATE),
+                    "${CallLog.Calls.TYPE} = ? AND ${CallLog.Calls.DATE} >= ?",
+                    arrayOf(CallLog.Calls.OUTGOING_TYPE.toString(), sinceMillis.toString()),
+                    "${CallLog.Calls.DATE} DESC"
+                ) ?: return null
+                cursor.use {
+                    while (it.moveToNext()) {
+                        val logged = it.getString(0).orEmpty().filter { c -> c.isDigit() }.takeLast(9)
+                        if (logged == wanted || logged.endsWith(wanted) || wanted.endsWith(logged)) {
+                            return it.getLong(1)
+                        }
+                    }
+                    null
+                }
+            } catch (e: SecurityException) {
+                Log.w(TAG, "READ_CALL_LOG not granted", e)
+                null
+            } catch (e: Exception) {
+                Log.w(TAG, "CallLog query failed", e)
+                null
+            }
+        }
     }
 }

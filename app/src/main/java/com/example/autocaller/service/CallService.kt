@@ -17,6 +17,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import com.example.autocaller.R
 import com.example.autocaller.data.AppDatabase
+import com.example.autocaller.data.CallDao
 import com.example.autocaller.data.RepeatType
 import com.example.autocaller.data.ScheduledCall
 import com.example.autocaller.scheduler.AlarmScheduler
@@ -33,21 +34,33 @@ import kotlinx.coroutines.withTimeoutOrNull
  * stops or schedules the next retry — all from the foreground service so
  * it survives the app being closed.
  *
- * Outcome rules (per scheduled call, each with its own retry counter):
- * - OFFHOOK at any point = answered -> stop retries, cycle done.
- * - IDLE after ringing < 5s and never OFFHOOK = rejected -> stop retries.
- * - IDLE after ringing >= ringDurationSeconds, or still ringing when the
- *   observation window ends = no answer -> retry after the user-set
- *   retryIntervalMinutes, until maxRetries attempts are done.
- * - Another call already in progress (OFFHOOK/RINGING) when this attempt
- *   fires = queue: delay this attempt by 60s, do NOT count it as an
- *   attempt, never cancel it, never run two calls at once.
- *
- * Known limit: Android does not let a normal app end a call, so if the
- * other side is still ringing when the ring-duration window ends we
- * cannot hang up for them — we schedule the retry and stop watching.
- * If they answer after that window, the already-scheduled retry may
- * still fire once; the next attempt then sees the line busy and queues.
+ * Outcome rules (v3 — fixed):
+ * - PRECISE_CALL_STATE_ACTIVE (API 31+) = the remote side ANSWERED.
+ *   OFFHOOK alone NEVER means answered for an outgoing call: it only
+ *   means dialling started. v2 completed every attempt as Answered on
+ *   OFFHOOK, so retries 2, 3, 4 never rang.
+ * - Call ends (DISCONNECTED / IDLE) without ACTIVE: resolve via CallLog
+ *   (READ_CALL_LOG): last outgoing call to this number in the last
+ *   3 minutes with duration >= 3s = answered, duration == 0 =
+ *   no answer / rejected. Without CallLog, timing fallback:
+ *   ended < 5s after dialling = rejected, ended after >=
+ *   ringDurationSeconds = no answer.
+ * - Still ringing when ringDurationSeconds + 10s grace expires:
+ *   no answer -> schedule the retry immediately and stop monitoring.
+ *   (A normal app cannot hang up, so the retry is queued if the line
+ *   is still busy when it fires.)
+ * - Another call already in progress when this attempt fires = queue:
+ *   delay this attempt by 60s, do NOT count it as an attempt, never
+ *   cancel it, never run two calls at once.
+ * - A queue-delayed alarm is the SAME attempt delayed, not a new
+ *   attempt: it reuses the stored attemptCount and does not increment
+ *   it again on the next queue delay. Only an actual dial increments.
+ * - Main trigger (!isRetry && !isQueueDelay): attempt 1, counter reset
+ *   here in the service at the start of the attempt — never in the
+ *   receiver, which raced the retry alarm.
+ * - Repeating calls are re-armed for their next occurrence HERE, after
+ *   the trigger cycle finishes (answered / rejected / max retries),
+ *   never by the receiver before the attempt runs.
  */
 class CallService : Service() {
 
@@ -74,10 +87,11 @@ class CallService : Service() {
             return START_NOT_STICKY
         }
         val isRetry = intent?.getBooleanExtra(AlarmScheduler.EXTRA_RETRY, false) ?: false
+        val isQueueDelay = intent?.getBooleanExtra(AlarmScheduler.EXTRA_QUEUE_DELAY, false) ?: false
 
         scope.launch {
             try {
-                runAttempt(callId, isRetry)
+                runAttempt(callId, isRetry, isQueueDelay)
             } catch (e: Exception) {
                 Log.e(TAG, "Call execution failed", e)
             } finally {
@@ -87,89 +101,147 @@ class CallService : Service() {
         return START_STICKY
     }
 
-    private suspend fun runAttempt(callId: Long, isRetry: Boolean) {
+    private suspend fun runAttempt(callId: Long, isRetry: Boolean, isQueueDelay: Boolean) {
         val dao = AppDatabase.get(applicationContext).callDao()
         var call = dao.getById(callId) ?: return
         if (!call.enabled) return
 
         // --- Queue: one call at a time. If the line is busy, delay 60s. ---
+        // No counter change: the delayed attempt is the same attempt.
         val telephony = applicationContext.getSystemService(TelephonyManager::class.java)
         if (telephony != null && telephony.callState != TelephonyManager.CALL_STATE_IDLE) {
-            Log.i(TAG, "Line busy, queueing call ${call.id} for 60s")
+            Log.i(TAG, "Line busy, queueing call ${call.id} for 60s (attempt stays ${call.attemptCount})")
             notify(buildNotification(getString(R.string.notif_queued, call.name)))
             AlarmScheduler.scheduleQueueDelay(applicationContext, call.id)
             return
         }
 
-        // Attempt number for this trigger cycle (receiver already reset it
-        // to 0 on a main trigger; retries keep counting).
-        val baseAttempts = if (isRetry) call.attemptCount else 0
-        val attemptNumber = baseAttempts + 1
+        // Attempt number. Queue-delay reuses the stored counter (0 -> 1 for
+        // the first attempt, otherwise the same number again, no increment).
+        // Retry = stored + 1. Main trigger = 1, counter reset here.
+        val attemptNumber = when {
+            isQueueDelay -> if (call.attemptCount <= 0) 1 else call.attemptCount
+            isRetry -> call.attemptCount + 1
+            else -> 1
+        }
         val attemptStartedAt = System.currentTimeMillis()
         call = call.copy(attemptCount = attemptNumber, lastAttemptMillis = attemptStartedAt)
         dao.update(call)
 
         val ringSeconds = call.ringDurationSeconds.coerceIn(5, 120)
         val outcome = CompletableDeferred<Outcome>()
-        var firstRingingAt = -1L
-        var everOffhook = false
+        var everActive = false
+        var dialStartedAt = -1L
+        var endedAt = -1L
 
-        val monitor = CallStateMonitor(applicationContext) { state ->
-            when (state) {
-                TelephonyManager.CALL_STATE_OFFHOOK -> {
-                    everOffhook = true
-                    if (!outcome.isCompleted) outcome.complete(Outcome.Answered)
-                }
-                TelephonyManager.CALL_STATE_RINGING -> {
-                    if (firstRingingAt < 0) firstRingingAt = System.currentTimeMillis()
-                }
-                TelephonyManager.CALL_STATE_IDLE -> {
-                    if (firstRingingAt >= 0 && !everOffhook && !outcome.isCompleted) {
-                        val rangFor = System.currentTimeMillis() - firstRingingAt
-                        // Rejected quickly (< 5s of ringing) vs rang out.
-                        if (rangFor < REJECTED_RING_THRESHOLD_MS) {
-                            outcome.complete(Outcome.Rejected)
-                        } else {
-                            outcome.complete(Outcome.NoAnswer)
+        val monitor = CallStateMonitor(
+            applicationContext,
+            onPreciseStateChanged = { precise ->
+                when (precise) {
+                    android.telecom.Call.PRECISE_CALL_STATE_ACTIVE -> {
+                        everActive = true
+                        if (!outcome.isCompleted) outcome.complete(Outcome.Answered)
+                    }
+                    android.telecom.Call.PRECISE_CALL_STATE_DIALING -> {
+                        if (dialStartedAt < 0) dialStartedAt = System.currentTimeMillis()
+                    }
+                    android.telecom.Call.PRECISE_CALL_STATE_DISCONNECTED -> {
+                        if (!outcome.isCompleted) {
+                            endedAt = System.currentTimeMillis()
+                            outcome.complete(Outcome.Ended)
                         }
                     }
+                    // PRECISE_CALL_STATE_RINGING is incoming only; ignore.
+                }
+            },
+            onLegacyStateChanged = { state ->
+                when (state) {
+                    // OFFHOOK on an outgoing call = dialling / line active.
+                    // It is NOT an answer. Record dial start only.
+                    TelephonyManager.CALL_STATE_OFFHOOK -> {
+                        if (dialStartedAt < 0) dialStartedAt = System.currentTimeMillis()
+                    }
+                    TelephonyManager.CALL_STATE_IDLE -> {
+                        if (!outcome.isCompleted) {
+                            endedAt = System.currentTimeMillis()
+                            outcome.complete(Outcome.Ended)
+                        }
+                    }
+                    // RINGING is incoming only; ignore.
                 }
             }
-        }
+        )
 
         notify(buildNotification(getString(R.string.notif_calling, call.name)))
         monitor.start()
         try {
             val placed = CallPlacer.place(applicationContext, call)
             if (!placed) {
-                showFailure(call)
                 handleOutcome(call, Outcome.NotPlaced, dao)
                 return
             }
-            // Observe for the user-set ring duration (+5s grace for the
-            // dialer to report the state change). OFFHOOK completes early.
-            val result = withTimeoutOrNull(ringSeconds * 1000L + 5_000L) {
+            if (dialStartedAt < 0) dialStartedAt = attemptStartedAt
+            // Observe for the user-set ring duration (+10s grace for the
+            // dialer / telecom to report state changes). ACTIVE completes
+            // early; a timeout with the line still ringing = no answer.
+            val raw = withTimeoutOrNull(ringSeconds * 1000L + 10_000L) {
                 outcome.await()
-            } ?: if (firstRingingAt >= 0) Outcome.NoAnswer else Outcome.Timeout
-            handleOutcome(call.copy(attemptCount = attemptNumber), result, dao)
+            } ?: Outcome.Timeout
+            val resolved = resolveOutcome(raw, call, dialStartedAt, endedAt, everActive)
+            handleOutcome(call.copy(attemptCount = attemptNumber), resolved, dao)
         } finally {
             monitor.stop()
         }
     }
 
+    /**
+     * Turns a raw end-of-call signal into Answered / Rejected / NoAnswer.
+     * CallLog is the authority when available; timing is the fallback.
+     * The 5s rejected threshold applies only here, never to OFFHOOK.
+     */
+    private fun resolveOutcome(
+        raw: Outcome,
+        call: ScheduledCall,
+        dialStartedAt: Long,
+        endedAt: Long,
+        everActive: Boolean
+    ): Outcome {
+        if (raw == Outcome.Answered || everActive) return Outcome.Answered
+        if (raw == Outcome.NotPlaced) return Outcome.NotPlaced
+        if (raw == Outcome.Timeout) return Outcome.NoAnswer
+        // raw == Ended: the call finished without ACTIVE.
+        val dialStart = if (dialStartedAt > 0) dialStartedAt else call.lastAttemptMillis
+        val duration = CallStateMonitor.lastOutgoingCallDuration(
+            applicationContext, call.number, dialStart - 5_000L
+        )
+        if (duration != null) {
+            return if (duration >= ANSWERED_CALL_LOG_MIN_SECONDS) Outcome.Answered
+            else if (endedAt > 0 && endedAt - dialStart < REJECTED_RING_THRESHOLD_MS) Outcome.Rejected
+            else Outcome.NoAnswer
+        }
+        // No CallLog (permission missing or no row yet): timing fallback.
+        if (endedAt > 0 && endedAt - dialStart < REJECTED_RING_THRESHOLD_MS) return Outcome.Rejected
+        return Outcome.NoAnswer
+    }
+
     private suspend fun handleOutcome(
         call: ScheduledCall,
         outcome: Outcome,
-        dao: com.example.autocaller.data.CallDao
+        dao: CallDao
     ) {
         when (outcome) {
             Outcome.Answered, Outcome.Rejected -> {
-                // Cycle done: reset the counter. A repeating call stays
-                // enabled for its next scheduled occurrence; a one-time
-                // call is finished.
-                val finished = if (call.repeat == RepeatType.ONCE) call.copy(enabled = false, attemptCount = 0)
-                else call.copy(attemptCount = 0)
+                // Cycle done: reset the counter. Re-arm a repeating call
+                // for its next occurrence here, after the cycle finished.
+                val finished = if (call.repeat == RepeatType.ONCE) {
+                    call.copy(enabled = false, attemptCount = 0)
+                } else {
+                    call.copy(attemptCount = 0)
+                }
                 dao.update(finished)
+                if (call.repeat != RepeatType.ONCE && finished.enabled) {
+                    AlarmScheduler.schedule(applicationContext, finished)
+                }
                 notify(buildNotification(getString(R.string.notif_running)))
             }
             Outcome.NoAnswer, Outcome.Timeout, Outcome.NotPlaced -> {
@@ -186,11 +258,21 @@ class CallService : Service() {
                     // attemptCount stays: the retry alarm resumes the cycle.
                 } else {
                     // Max attempts reached (or retries off): cycle done.
-                    val finished = if (call.repeat == RepeatType.ONCE) call.copy(enabled = false, attemptCount = 0)
-                    else call.copy(attemptCount = 0)
+                    val finished = if (call.repeat == RepeatType.ONCE) {
+                        call.copy(enabled = false, attemptCount = 0)
+                    } else {
+                        call.copy(attemptCount = 0)
+                    }
                     dao.update(finished)
+                    if (call.repeat != RepeatType.ONCE && finished.enabled) {
+                        AlarmScheduler.schedule(applicationContext, finished)
+                    }
                     showFailure(call)
                 }
+            }
+            Outcome.Ended -> {
+                // Should have been resolved before handleOutcome; treat as no answer.
+                handleOutcome(call, Outcome.NoAnswer, dao)
             }
         }
     }
@@ -250,14 +332,16 @@ class CallService : Service() {
         }
     }
 
-    private enum class Outcome { Answered, Rejected, NoAnswer, Timeout, NotPlaced }
+    private enum class Outcome { Answered, Rejected, NoAnswer, Timeout, NotPlaced, Ended }
 
     companion object {
         private const val TAG = "CallService"
         private const val CHANNEL_ID = "calls_channel"
         private const val NOTIFICATION_ID = 1001
         private const val FAILURE_ID_BASE = 2000
-        /** Ringing shorter than this without OFFHOOK counts as "rejected". */
+        /** Call ended sooner than this after dialling = "rejected" (fallback only). */
         private const val REJECTED_RING_THRESHOLD_MS = 5_000L
+        /** CallLog duration (seconds) that counts as answered. */
+        private const val ANSWERED_CALL_LOG_MIN_SECONDS = 3L
     }
 }

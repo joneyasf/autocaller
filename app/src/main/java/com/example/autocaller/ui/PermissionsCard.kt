@@ -44,6 +44,9 @@ fun PermissionsCard(
             if (!status.hasPhoneState) {
                 PermissionRow(stringResource(R.string.perm_phone_state), stringResource(R.string.grant), onGrantRuntime)
             }
+            if (!status.hasCallLog) {
+                PermissionRow(stringResource(R.string.perm_call_log), stringResource(R.string.grant), onGrantRuntime)
+            }
             if (!status.hasNotif) {
                 PermissionRow(stringResource(R.string.perm_notif), stringResource(R.string.grant), onGrantRuntime)
             }

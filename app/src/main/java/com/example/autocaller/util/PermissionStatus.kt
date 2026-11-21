@@ -15,14 +15,16 @@ import androidx.core.content.ContextCompat
 data class PermissionStatus(
     val hasCall: Boolean,
     val hasPhoneState: Boolean,
+    val hasCallLog: Boolean,
     val canExact: Boolean,
     val hasNotif: Boolean
 ) {
-    val allGranted: Boolean get() = hasCall && hasPhoneState && canExact && hasNotif
+    val allGranted: Boolean get() = hasCall && hasPhoneState && hasCallLog && canExact && hasNotif
 
     fun missingRuntime(): Array<String> = buildList {
         if (!hasCall) add(Manifest.permission.CALL_PHONE)
         if (!hasPhoneState) add(Manifest.permission.READ_PHONE_STATE)
+        if (!hasCallLog) add(Manifest.permission.READ_CALL_LOG)
         if (!hasNotif) add(Manifest.permission.POST_NOTIFICATIONS)
     }.toTypedArray()
 
@@ -47,7 +49,14 @@ data class PermissionStatus(
                 ) == PackageManager.PERMISSION_GRANTED
             } else true
 
-            return PermissionStatus(hasCall, hasPhoneState, canExact, hasNotif)
+            // Needed to tell answered (call-log duration >= 3s) from
+            // no-answer / rejected after a call ends. Without it the
+            // timing fallback is used instead.
+            val hasCallLog = ContextCompat.checkSelfPermission(
+                context, Manifest.permission.READ_CALL_LOG
+            ) == PackageManager.PERMISSION_GRANTED
+
+            return PermissionStatus(hasCall, hasPhoneState, hasCallLog, canExact, hasNotif)
         }
 
         fun appSettingsIntent(context: Context): Intent =
