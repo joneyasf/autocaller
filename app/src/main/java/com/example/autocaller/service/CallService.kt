@@ -147,7 +147,12 @@ class CallService : Service() {
                     if (dialStartedAt < 0) dialStartedAt = System.currentTimeMillis()
                 }
                 TelephonyManager.CALL_STATE_IDLE -> {
-                    if (!outcome.isCompleted) {
+                    // Ignore IDLE until dialling actually started:
+                    // registering the listener fires an immediate callback
+                    // with the current state (IDLE). Without this guard the
+                    // app decided "rejected" before the call was even placed,
+                    // and retries 2, 3, 4 never rang.
+                    if (dialStartedAt >= 0 && !outcome.isCompleted) {
                         endedAt = System.currentTimeMillis()
                         outcome.complete(Outcome.Ended)
                     }
