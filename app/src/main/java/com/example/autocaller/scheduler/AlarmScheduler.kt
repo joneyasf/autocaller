@@ -196,7 +196,7 @@ object AlarmScheduler {
             val next = nextTriggerMillis(call, now)
             if (next == null) {
                 // Expired one-time call, missed within the last 24h.
-                if (ChronoUnit.HOURS.between(start, now) in 0..24) {
+                if (ChronoUnit.HOURS.between(start, now) in 0L..24L) {
                     Log.i(TAG, "Overdue one-time call ${call.id}, firing in 1 min")
                     scheduleQueueDelay(context, call.id)
                 }
