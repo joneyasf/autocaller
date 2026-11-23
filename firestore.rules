@@ -1,0 +1,17 @@
+rules_version = '2';
+
+// v1.5: activation counting. Only the "activations" collection is usable:
+// any device may create/update/read its own activation document (update is
+// needed so the same device re-activating overwrites its document instead
+// of double-counting), nothing may be deleted, and everything else is denied.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /activations/{docId} {
+      allow create, update, read: if true;
+      allow delete: if false;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

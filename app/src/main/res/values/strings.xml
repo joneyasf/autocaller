@@ -51,4 +51,9 @@
     <string name="notif_failed_hint">اضغط للاتصال يدوياً</string>
     <string name="opening_dua">صلِّ على النبيّ وادعُ لوالدي بالرحمة والمغفرة</string>
     <string name="dua_dismiss">اللهم صلِّ وسلم على نبينا محمد</string>
+    <!-- v1.5: activation -->
+    <string name="activation_title">تفعيل التطبيق</string>
+    <string name="activation_hint">أدخل مفتاح التفعيل</string>
+    <string name="activation_button">تفعيل</string>
+    <string name="activation_error">المفتاح غير صحيح، حاول مرة أخرى</string>
 </resources>
